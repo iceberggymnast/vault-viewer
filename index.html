@@ -77,6 +77,10 @@ a { color: var(--link); text-decoration: none; }
 .tabs { flex: 1; display: flex; gap: 4px; padding: 4px; background: var(--code-bg); border-radius: 10px; }
 .tabs button { flex: 1; border: 0; min-height: 36px; padding: 6px 4px; font-size: 14px; color: var(--muted); }
 .tabs button.on { background: var(--bg); color: var(--fg); font-weight: 600; box-shadow: 0 1px 3px #0003; }
+.sort { display: flex; gap: 4px; justify-content: flex-end; margin: -4px 0 4px; }
+.sort button { min-height: 32px; padding: 4px 10px; font-size: 13px; border: 0; color: var(--muted); }
+.sort button.on { background: var(--code-bg); color: var(--fg); font-weight: 600; }
+.tree .f .t { float: right; margin-left: 8px; color: var(--muted); font-size: 12px; line-height: 29px; }
 
 /* 애니메이션 */
 @keyframes enter { from { opacity: 0; transform: translateY(8px); } }
@@ -150,6 +154,11 @@ const CHANGES_COMMITS = 30; // 최근 변경을 모을 때 훑는 커밋 수
 let tab = lsGet(LS_TAB) || 'read';
 let changes = null;         // 최근 커밋에서 바뀐 md [{p, t}], 최신순
 let changesPromise = null;
+const LS_SORT = 'vv.sort';
+const GQL_CHUNK = 100;      // GraphQL 요청 하나에 묻는 파일 수
+let sortMode = lsGet(LS_SORT) || 'name';
+let mtimes = null;          // md 경로 -> 마지막 커밋 시각(ms)
+let mtimesPromise = null;
 const LOADING = '<div class="loading"><i></i><i></i><i></i></div>';
 
 function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
@@ -181,16 +190,18 @@ function relTime(t) {
 }
 
 // ---------- GitHub API ----------
+function authFail() {
+  localStorage.removeItem(LS_TOKEN);
+  showSetup('토큰이 거부되었습니다(만료 또는 삭제). 새 토큰을 입력하세요.');
+  throw new Error('401');
+}
+
 async function api(path, accept) {
   const r = await fetch('https://api.github.com/repos/' + cfg.repo + path, {
     headers: { Authorization: 'Bearer ' + cfg.token, Accept: accept || 'application/vnd.github+json' },
     cache: 'no-cache',
   });
-  if (r.status === 401) {
-    localStorage.removeItem(LS_TOKEN);
-    showSetup('토큰이 거부되었습니다(만료 또는 삭제). 새 토큰을 입력하세요.');
-    throw new Error('401');
-  }
+  if (r.status === 401) authFail();
   if (r.status === 404 && path === '')
     throw new Error('저장소 ' + cfg.repo + '를 찾을 수 없습니다.\n저장소 이름이 맞는지, 토큰 설정의 Repository access에 이 저장소가 선택되어 있는지 확인하세요.');
   if (!r.ok) throw new Error(r.status + ' ' + r.statusText + ' — ' + path);
@@ -219,6 +230,34 @@ async function loadChanges() {
       out.push({ p: f.filename, t: Date.parse(d.commit.committer.date) });
     }
   }
+  return out;
+}
+
+// 노트마다 마지막 커밋 시각. REST로는 파일당 요청이 필요해 GraphQL로 묶어 묻는다
+async function loadMtimes() {
+  const [owner, name] = cfg.repo.split('/');
+  const md = files.filter(p => ext(p) === 'md');
+  const chunks = [];
+  for (let i = 0; i < md.length; i += GQL_CHUNK) chunks.push(md.slice(i, i + GQL_CHUNK));
+  const out = new Map();
+  await Promise.all(chunks.map(async chunk => {
+    const fields = chunk.map((p, i) => `f${i}: history(first: 1, path: ${JSON.stringify(p)}) { nodes { committedDate } }`).join('\n');
+    const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {
+      object(expression: ${JSON.stringify(branch)}) { ... on Commit { ${fields} } } } }`;
+    const r = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + cfg.token },
+      body: JSON.stringify({ query }),
+    });
+    if (r.status === 401) authFail();
+    const j = await r.json();
+    if (j.errors) throw new Error(j.errors[0].message);
+    const obj = j.data.repository.object;
+    chunk.forEach((p, i) => {
+      const n = obj['f' + i].nodes[0];
+      if (n) out.set(p, Date.parse(n.committedDate));
+    });
+  }));
   return out;
 }
 
@@ -408,7 +447,8 @@ function showSetup(msg) {
   if (lo) lo.onclick = () => { localStorage.removeItem(LS_TOKEN); cfg.token = ''; showSetup(); };
 }
 
-function buildTree(paths) {
+// times가 있으면 최근순(폴더는 안에 든 노트 중 가장 최근 시각 기준), 없으면 이름순
+function buildTree(paths, times) {
   const root = {};
   for (const p of paths) {
     let node = root;
@@ -416,13 +456,38 @@ function buildTree(paths) {
     segs.slice(0, -1).forEach(s => { node = node[s + '/'] = node[s + '/'] || {}; });
     node[segs.at(-1)] = p;
   }
+  const timeOf = (node, k) => k.endsWith('/')
+    ? Math.max(0, ...Object.keys(node[k]).map(c => timeOf(node[k], c)))
+    : times.get(node[k]) || 0;
   const html = (node, dir) => Object.keys(node)
-    .sort((a, b) => (b.endsWith('/') - a.endsWith('/')) || a.localeCompare(b, 'ko'))
-    .map(k => k.endsWith('/')
-      ? `<details data-dir="${esc(dir + k)}"${openDirs.has(dir + k) ? ' open' : ''}><summary>${esc(k.slice(0, -1))}</summary>${html(node[k], dir + k)}</details>`
-      : `<a class="f" href="${hrefFor(node[k])}">${esc(baseName(k))}</a>`)
+    .sort((a, b) => (b.endsWith('/') - a.endsWith('/'))
+      || (times ? timeOf(node, b) - timeOf(node, a) : 0)
+      || a.localeCompare(b, 'ko', { numeric: true }))
+    .map(k => {
+      if (k.endsWith('/'))
+        return `<details data-dir="${esc(dir + k)}"${openDirs.has(dir + k) ? ' open' : ''}><summary>${esc(k.slice(0, -1))}</summary>${html(node[k], dir + k)}</details>`;
+      const t = times && times.get(node[k]);
+      return `<a class="f" href="${hrefFor(node[k])}">${t ? `<small class="t">${relTime(t)}</small>` : ''}${esc(baseName(k))}</a>`;
+    })
     .join('');
   return html(root, '');
+}
+
+function allHtml(md) {
+  const bar = `<div class="sort">
+    <button data-sort="name"${sortMode === 'name' ? ' class="on"' : ''}>이름순</button>
+    <button data-sort="recent"${sortMode === 'recent' ? ' class="on"' : ''}>최근순</button></div>`;
+  if (sortMode === 'name') return bar + buildTree(md);
+  if (mtimes) return bar + buildTree(md, mtimes);
+  mtimesPromise = mtimesPromise || loadMtimes().then(m => {
+    mtimes = m;
+    if (tab === 'all' && sortMode === 'recent' && document.getElementById('list')) renderList(true);
+  }, e => {
+    mtimesPromise = null;
+    const box = document.getElementById('list');
+    if (e.message !== '401' && box && tab === 'all') box.innerHTML = bar + `<p class="err">불러오기 실패: ${esc(e.message)}</p>`;
+  });
+  return bar + LOADING;
 }
 
 const itemHtml = (p, sub) => `<a class="f" href="${hrefFor(p)}">${esc(baseName(p))}<small>${esc(sub)}</small></a>`;
@@ -453,7 +518,7 @@ function renderList(withAnim) {
     box.innerHTML = hits.length ? hits.map(p => itemHtml(p, dirOf(p))).join('') : '<p class="muted">결과 없음</p>';
   } else if (tab === 'all') {
     box.className = 'tree';
-    box.innerHTML = buildTree(md);
+    box.innerHTML = allHtml(md);
   } else if (tab === 'read') {
     const list = loadRecent().filter(r => files.includes(r.p));
     box.className = 'items';
@@ -489,6 +554,13 @@ function showHome() {
     if (query) { query = ''; q.value = ''; }
     renderList(true);
   };
+  document.getElementById('list').addEventListener('click', e => {
+    const b = e.target.closest('[data-sort]');
+    if (!b || b.dataset.sort === sortMode) return;
+    sortMode = b.dataset.sort;
+    lsSet(LS_SORT, sortMode);
+    renderList(true);
+  });
   document.getElementById('list').addEventListener('toggle', e => {
     const d = e.target.dataset.dir;
     if (d) e.target.open ? openDirs.add(d) : openDirs.delete(d);
@@ -497,6 +569,8 @@ function showHome() {
     main.innerHTML = LOADING;
     changes = null;
     changesPromise = null;
+    mtimes = null;
+    mtimesPromise = null;
     try { await loadTree(); showHome(); } catch (e) { if (e.message !== '401') main.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
   };
   renderList();
