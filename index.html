@@ -65,10 +65,32 @@ a { color: var(--link); text-decoration: none; }
   border-radius: 10px; background: var(--code-bg); color: var(--fg); margin-bottom: 12px; }
 .tree details { margin-left: 4px; }
 .tree details details, .tree details > .f { margin-left: 16px; }
-.tree summary { padding: 10px 0; cursor: pointer; font-weight: 600; }
-.tree .f, .results .f { display: block; padding: 10px 0; }
-.results .f small { display: block; color: var(--muted); font-size: 12px; line-height: 1.3; }
-.toolbar { display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 8px; }
+.tree summary { padding: 10px 0; cursor: pointer; font-weight: 600; list-style: none; }
+.tree summary::-webkit-details-marker { display: none; }
+.tree summary::before { content: '›'; display: inline-block; width: 1em; color: var(--muted); transition: transform .2s ease; }
+.tree details[open] > summary::before { transform: rotate(90deg); }
+.tree details[open] > :not(summary) { animation: enter .18s ease-out; }
+.tree .f, .items .f { display: block; padding: 10px 8px; margin: 0 -8px; border-radius: 8px; transition: background-color .15s; }
+.tree .f:active, .items .f:active { background: var(--code-bg); }
+.items .f small { display: block; color: var(--muted); font-size: 12px; line-height: 1.3; }
+.toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+.tabs { flex: 1; display: flex; gap: 4px; padding: 4px; background: var(--code-bg); border-radius: 10px; }
+.tabs button { flex: 1; border: 0; min-height: 36px; padding: 6px 4px; font-size: 14px; color: var(--muted); }
+.tabs button.on { background: var(--bg); color: var(--fg); font-weight: 600; box-shadow: 0 1px 3px #0003; }
+
+/* 애니메이션 */
+@keyframes enter { from { opacity: 0; transform: translateY(8px); } }
+@keyframes shimmer { to { background-position: -200% 0; } }
+.enter { animation: enter .22s ease-out; }
+button { transition: transform .1s, background-color .2s, color .2s; }
+button:active { transform: scale(.96); }
+.loading i { display: block; height: 14px; margin: 16px 0; border-radius: 7px;
+  background: linear-gradient(90deg, var(--code-bg) 25%, var(--line) 50%, var(--code-bg) 75%);
+  background-size: 200% 100%; animation: shimmer 1.2s linear infinite; }
+.loading i:nth-child(1) { width: 55%; } .loading i:nth-child(2) { width: 90%; } .loading i:nth-child(3) { width: 75%; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before { animation: none !important; transition: none !important; }
+}
 
 /* 노트 */
 .note img { max-width: 100%; height: auto; border-radius: 6px; }
@@ -122,12 +144,41 @@ const openDirs = new Set();  // 목록에서 펼쳐 둔 폴더
 let renderSeq = 0;         // 빠르게 이동할 때 이전 요청 결과가 덮어쓰지 않게 한다
 const imgCache = new Map(); // path -> object URL
 
+const LS_RECENT = 'vv.recent', LS_TAB = 'vv.tab';
+const RECENT_MAX = 30;      // 최근 읽음에 남기는 개수
+const CHANGES_COMMITS = 30; // 최근 변경을 모을 때 훑는 커밋 수
+let tab = lsGet(LS_TAB) || 'read';
+let changes = null;         // 최근 커밋에서 바뀐 md [{p, t}], 최신순
+let changesPromise = null;
+const LOADING = '<div class="loading"><i></i><i></i><i></i></div>';
+
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
 const esc = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const encPath = p => p.split('/').map(encodeURIComponent).join('/');
 const ext = p => (p.match(/\.([^./]+)$/) || [, ''])[1].toLowerCase();
 const baseName = p => p.split('/').pop().replace(/\.md$/i, '');
 const dec = s => { try { return decodeURIComponent(s); } catch { return s; } };
 const hrefFor = (path, heading) => '#' + encodeURIComponent(path) + (heading ? '?h=' + encodeURIComponent(heading) : '');
+const dirOf = p => p.split('/').slice(0, -1).join('/') || '/';
+
+function animate(el) {
+  el.classList.remove('enter');
+  void el.offsetWidth; // 같은 요소에 애니메이션을 다시 걸기 위해 리플로우
+  el.classList.add('enter');
+}
+
+function relTime(t) {
+  const m = Math.round((Date.now() - t) / 60000);
+  if (m < 1) return '방금';
+  if (m < 60) return m + '분 전';
+  const h = Math.round(m / 60);
+  if (h < 24) return h + '시간 전';
+  const d = Math.round(h / 24);
+  if (d < 7) return d + '일 전';
+  return new Date(t).toLocaleDateString('ko-KR');
+}
 
 // ---------- GitHub API ----------
 async function api(path, accept) {
@@ -154,6 +205,31 @@ async function loadTree() {
   files = t.tree
     .filter(e => e.type === 'blob' && !e.path.split('/').some(s => s.startsWith('.')))
     .map(e => e.path);
+}
+
+// 최근 커밋의 변경 파일을 모은다. 커밋마다 상세 조회가 필요해 '최근 변경' 탭을 열 때만 부른다
+async function loadChanges() {
+  const commits = await (await api('/commits?sha=' + encodeURIComponent(branch) + '&per_page=' + CHANGES_COMMITS)).json();
+  const details = await Promise.all(commits.map(c => api('/commits/' + c.sha).then(r => r.json())));
+  const seen = new Set(), out = [];
+  for (const d of details) {
+    for (const f of d.files || []) {
+      if (ext(f.filename) !== 'md' || seen.has(f.filename) || !files.includes(f.filename)) continue;
+      seen.add(f.filename);
+      out.push({ p: f.filename, t: Date.parse(d.commit.committer.date) });
+    }
+  }
+  return out;
+}
+
+function loadRecent() {
+  try { return JSON.parse(lsGet(LS_RECENT)) || []; } catch { return []; }
+}
+
+function markRead(path) {
+  const list = loadRecent().filter(r => r.p !== path);
+  list.unshift({ p: path, t: Date.now() });
+  lsSet(LS_RECENT, JSON.stringify(list.slice(0, RECENT_MAX)));
 }
 
 // ---------- 링크 해석 (옵시디언과 같이: 파일명 일치, 여러 개면 가장 짧은 경로) ----------
@@ -349,36 +425,82 @@ function buildTree(paths) {
   return html(root, '');
 }
 
-function renderList() {
+const itemHtml = (p, sub) => `<a class="f" href="${hrefFor(p)}">${esc(baseName(p))}<small>${esc(sub)}</small></a>`;
+
+function changesHtml() {
+  if (changes) return changes.length
+    ? changes.map(c => itemHtml(c.p, dirOf(c.p) + ' · ' + relTime(c.t))).join('')
+    : '<p class="muted">최근 변경이 없습니다.</p>';
+  changesPromise = changesPromise || loadChanges().then(c => {
+    changes = c;
+    if (tab === 'changed' && document.getElementById('list')) renderList(true);
+  }, e => {
+    changesPromise = null;
+    const box = document.getElementById('list');
+    if (e.message !== '401' && box && tab === 'changed') box.innerHTML = `<p class="err">불러오기 실패: ${esc(e.message)}</p>`;
+  });
+  return LOADING;
+}
+
+function renderList(withAnim) {
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
   const md = files.filter(p => ext(p) === 'md');
   const box = document.getElementById('list');
-  if (!terms.length) { box.className = 'tree'; box.innerHTML = buildTree(md); return; }
-  const hits = md.filter(p => terms.every(t => p.toLowerCase().includes(t)));
-  box.className = 'results';
-  box.innerHTML = hits.length
-    ? hits.map(p => `<a class="f" href="${hrefFor(p)}">${esc(baseName(p))}<small>${esc(p)}</small></a>`).join('')
-    : '<p class="muted">결과 없음</p>';
+  for (const b of document.querySelectorAll('.tabs button')) b.classList.toggle('on', !terms.length && b.dataset.tab === tab);
+  if (terms.length) {
+    const hits = md.filter(p => terms.every(t => p.toLowerCase().includes(t)));
+    box.className = 'items';
+    box.innerHTML = hits.length ? hits.map(p => itemHtml(p, dirOf(p))).join('') : '<p class="muted">결과 없음</p>';
+  } else if (tab === 'all') {
+    box.className = 'tree';
+    box.innerHTML = buildTree(md);
+  } else if (tab === 'read') {
+    const list = loadRecent().filter(r => files.includes(r.p));
+    box.className = 'items';
+    box.innerHTML = list.length
+      ? list.map(r => itemHtml(r.p, dirOf(r.p) + ' · ' + relTime(r.t))).join('')
+      : '<p class="muted">아직 읽은 문서가 없습니다.</p>';
+  } else {
+    box.className = 'items';
+    box.innerHTML = changesHtml();
+  }
+  if (withAnim) animate(box);
 }
 
 function showHome() {
   currentPath = '';
   crumb.textContent = cfg.repo;
   main.innerHTML = `
-    <div class="toolbar"><button id="reload">목록 새로고침</button></div>
+    <div class="toolbar">
+      <div class="tabs">
+        <button data-tab="read">최근 읽음</button>
+        <button data-tab="changed">최근 변경</button>
+        <button data-tab="all">전체</button>
+      </div>
+      <button id="reload" aria-label="목록 새로고침">↻</button>
+    </div>
     <input id="q" type="search" placeholder="파일명·경로 검색" value="${esc(query)}">
     <div id="list"></div>`;
   const q = document.getElementById('q');
   q.oninput = () => { query = q.value; renderList(); };
+  for (const b of main.querySelectorAll('.tabs button')) b.onclick = () => {
+    tab = b.dataset.tab;
+    lsSet(LS_TAB, tab);
+    if (query) { query = ''; q.value = ''; }
+    renderList(true);
+  };
   document.getElementById('list').addEventListener('toggle', e => {
     const d = e.target.dataset.dir;
     if (d) e.target.open ? openDirs.add(d) : openDirs.delete(d);
   }, true);
   document.getElementById('reload').onclick = async () => {
-    main.innerHTML = '<p class="muted">불러오는 중…</p>';
+    main.innerHTML = LOADING;
+    changes = null;
+    changesPromise = null;
     try { await loadTree(); showHome(); } catch (e) { if (e.message !== '401') main.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
   };
   renderList();
+  animate(main);
   window.scrollTo(0, homeScroll);
 }
 
@@ -392,7 +514,7 @@ async function showFile(path, heading) {
   const seq = ++renderSeq;
   currentPath = path;
   crumb.textContent = path;
-  main.innerHTML = '<p class="muted">불러오는 중…</p>';
+  main.innerHTML = LOADING;
   window.scrollTo(0, 0);
   const box = document.createElement('article');
   box.className = 'note';
@@ -406,6 +528,7 @@ async function showFile(path, heading) {
       const frag = DOMPurify.sanitize(marked.parse(stripFrontmatter(text)), { RETURN_DOM_FRAGMENT: true });
       postProcess(frag, path);
       box.append(frag);
+      markRead(path);
     } else {
       box.innerHTML = '<p class="muted">이 형식은 뷰어에서 볼 수 없습니다.</p>';
     }
@@ -415,6 +538,7 @@ async function showFile(path, heading) {
     return;
   }
   main.replaceChildren(box);
+  animate(main);
   scrollToHeading(heading);
   loadImages(box);
   renderMermaid(box);
@@ -438,7 +562,7 @@ window.addEventListener('hashchange', route);
 (async () => {
   cfg = { token: localStorage.getItem(LS_TOKEN) || '', repo: localStorage.getItem(LS_REPO) || '' };
   if (!cfg.token || !cfg.repo) return showSetup();
-  main.innerHTML = '<p class="muted">불러오는 중…</p>';
+  main.innerHTML = LOADING;
   try { await loadTree(); } catch (e) {
     if (e.message !== '401') main.innerHTML = `<p class="err">연결 실패: ${esc(e.message)}</p><p><button onclick="location.reload()">다시 시도</button></p>`;
     return;
